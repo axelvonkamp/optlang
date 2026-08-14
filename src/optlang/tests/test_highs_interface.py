@@ -4,12 +4,10 @@ top of optlang's generic abstract test suite (abstract_test_cases.py).
 
 Scope
 -----
-highs_interface currently only supports continuous LP/QP problems (see the
-module docstring in highs_interface.py) - there is no MILP support. The
-abstract suite includes a number of tests that exercise integer/binary
-variables and indicator constraints; those are skipped here rather than
-implemented, per the LP/QP-only scope of this interface. Everything else
-from the abstract suite is implemented.
+highs_interface supports continuous LP/QP problems and mixed-integer linear
+programs. The abstract suite includes indicator constraints, which are still
+skipped here because HiGHS indicator constraints are not implemented in this
+interface. Everything else from the abstract suite is implemented.
 
 `test_clone_model_with_lp` is skipped too: it exercises Model.clone's
 use_lp=True path (round-tripping through to_lp()/from_lp()), which this
@@ -68,26 +66,20 @@ class HighsVariableTestCase(abstract_test_cases.AbstractVariableTestCase):
         self.assertNotIn("test", self.model.variables)
 
     def test_set_wrong_type_raises(self):
-        # Trimmed from the abstract version: this interface is LP/QP only
-        # (see highs_interface.Variable.__init__), so there's no valid
-        # "integer" type to switch to for the final two lines of the
-        # original test. See test_integer_and_binary_types_are_rejected
-        # below for the MIP-specific replacement.
         self.assertRaises(ValueError, self.interface.Variable, name="test", type="mayo")
         self.assertRaises(Exception, setattr, self.var, 'type', 'ketchup')
         self.model.add(self.var)
         self.assertRaises(ValueError, setattr, self.var, "type", "mustard")
 
-    @unittest.skip("HiGHS interface only supports continuous variables (LP/QP, no MIP).")
     def test_change_type(self):
-        pass
-
-    def test_integer_and_binary_types_are_rejected(self):
-        """Replacement for test_change_type: rather than silently accepting
-        a variable type the solver can never honor, construction should
-        fail outright for non-continuous types."""
-        self.assertRaises(ValueError, self.interface.Variable, "int_var", type="integer")
-        self.assertRaises(ValueError, self.interface.Variable, "bin_var", type="binary")
+        self.var.type = "continuous"
+        self.assertEqual(self.var.type, "continuous")
+        self.var.type = "integer"
+        self.assertEqual(self.var.type, "integer")
+        self.var.type = "binary"
+        self.assertEqual(self.var.type, "binary")
+        self.var.type = "continuous"
+        self.assertEqual(self.var.type, "continuous")
 
 
 class HighsConstraintTestCase(abstract_test_cases.AbstractConstraintTestCase):
@@ -402,45 +394,6 @@ class HighsModelTestCase(abstract_test_cases.AbstractModelTestCase):
                 0.3 * x + 0.4 * y ** x + 66. * z, lb=-100, ub=0., name='test'
             )
             self.model.add(constraint)
-
-    # --- MIP-only tests from the abstract suite: skipped, see module
-    # docstring. ------------------------------------------------------
-
-    @unittest.skip("MIP (integer variables) is not supported by this interface.")
-    def test_add_integer_var(self):
-        pass
-
-    @unittest.skip("MIP (integer variables) is not supported by this interface.")
-    def test_change_variable_type(self):
-        pass
-
-    @unittest.skip("MIP (binary variables) is not supported by this interface.")
-    def test_binary_variables(self):
-        pass
-
-    @unittest.skip("MIP (integer variables) is not supported by this interface.")
-    def test_integer_variable_dual(self):
-        pass
-
-    @unittest.skip("MIP (integer variables) is not supported by this interface.")
-    def test_integer_constraint_dual(self):
-        pass
-
-    @unittest.skip("MIP (integer variables) is not supported by this interface.")
-    def test_integer_batch_duals(self):
-        pass
-
-    @unittest.skip("MIP (integer variables) is not supported by this interface.")
-    def test_implicitly_convert_milp_to_lp(self):
-        pass
-
-    @unittest.skip("MIP (integer variables) is not supported by this interface.")
-    def test_optimize_milp(self):
-        pass
-
-    @unittest.skip("MIP (integer variables) is not supported by this interface.")
-    def test_is_integer(self):
-        pass
 
     @unittest.skip("Cloning via LP export/import (to_lp/from_lp) is not implemented for this interface.")
     def test_clone_model_with_lp(self):
