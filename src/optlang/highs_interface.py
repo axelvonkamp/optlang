@@ -1084,7 +1084,7 @@ class Model(interface.Model):
         for i in range(problem.getNumRow()):
             _, name = problem.getRowName(i)
             _, row_lb, row_ub, _ = problem.getRow(i)
-            _, idx, val = problem.getRowEntries(i)
+            _, idx, _ = problem.getRowEntries(i)
             # terms = [float(v) * self._variables[problem.variableName(int(j))] for j, v in zip(idx, val)]
             # expression = symbolics.add(terms) if terms else symbolics.sympify(0)
             # constraint = Constraint(
