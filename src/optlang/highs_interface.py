@@ -32,22 +32,32 @@ from optlang.exceptions import ContainerAlreadyContains
 log = logging.getLogger(__name__)
 
 
+# Keys are the strings returned by Highs.modelStatusToString() (verified
+# against highspy 1.15.1). Mirrors hybrid_interface._STATUS_MAP for the shared
+# statuses; where the two differ, the more specific optlang status is used here.
 _HIGHS_STATUS_TO_STATUS = {
     "Optimal": interface.OPTIMAL,
     "Infeasible": interface.INFEASIBLE,
     "Unbounded": interface.UNBOUNDED,
-    "Unbounded or infeasible": interface.INFEASIBLE_OR_UNBOUNDED,
-    "Infeasible or unbounded": interface.INFEASIBLE_OR_UNBOUNDED,
+    "Primal infeasible or unbounded": interface.INFEASIBLE_OR_UNBOUNDED,
     "Time limit reached": interface.TIME_LIMIT,
     "Iteration limit reached": interface.ITERATION_LIMIT,
+    "Memory limit reached": interface.MEMORY_LIMIT,
     # MIP-specific early-termination statuses (only ever returned once a
     # model has integer/binary variables and HiGHS' branch-and-bound runs):
     "Solution limit reached": interface.SOLUTION_LIMIT,
-    "Objective bound": interface.SUBOPTIMAL,
-    "Objective target": interface.SUBOPTIMAL,
-    "Interrupted by user callback": interface.ABORTED,
-    "Solve error": interface.UNDEFINED,
+    "Bound on objective reached": interface.SUBOPTIMAL,
+    "Target for objective reached": interface.SUBOPTIMAL,
+    "Interrupted by user": interface.ABORTED,
+    "Interrupted by HiGHS": interface.ABORTED,
+    "Load error": interface.SPECIAL,
+    "Model error": interface.SPECIAL,
+    "Presolve error": interface.SPECIAL,
+    "Solve error": interface.SPECIAL,
+    "Postsolve error": interface.SPECIAL,
+    "Empty": interface.UNDEFINED,
     "Not Set": interface.UNDEFINED,
+    "Unknown": interface.UNDEFINED,
 }
 
 _STATUSES_WITH_USABLE_SOLUTION = frozenset([
@@ -682,9 +692,22 @@ class Tolerances(object):
 
 
 class Configuration(interface.MathematicalProgrammingConfiguration):
+    # Allowed values as in hybrid_interface (_LP_METHODS), plus "hipo".
+    lp_methods = ("auto", "simplex", "interior point", "hipo")
+    # HiGHS solves QPs with its active-set solver; the only other choice is HiPO.
+    qp_methods = ("auto", "active set", "hipo")
+
+    # optlang name -> value of the HiGHS "solver" option
+    _LP_METHOD_TO_HIGHS = {
+        "auto": "choose", "simplex": "simplex", "interior point": "ipm", "hipo": "hipo",
+    }
+    _QP_METHOD_TO_HIGHS = {"auto": "choose", "active set": "qpasm", "hipo": "hipo"}
+
     def __init__(self, verbosity=0, timeout=None, presolve=True,
-                 problem=None, *args, **kwargs):
+                 problem=None, lp_method="auto", qp_method="auto", *args, **kwargs):
         self.problem = problem
+        self._lp_method = self._check_method(lp_method, self.lp_methods, "lp_method")
+        self._qp_method = self._check_method(qp_method, self.qp_methods, "qp_method")
         self._verbosity = verbosity
         self._timeout = timeout
         self._presolve = presolve
@@ -703,6 +726,69 @@ class Configuration(interface.MathematicalProgrammingConfiguration):
             h.setOptionValue("time_limit", float(self._timeout))
         h.setOptionValue("presolve", "on" if self._presolve else "off")
         self._apply_tolerances()
+        self._apply_solver_method()
+
+    @staticmethod
+    def _check_method(value, allowed, name):
+        if value not in allowed:
+            raise ValueError(
+                "%s must be one of %s (got %r)." % (name, ", ".join(map(repr, allowed)), value))
+        return value
+
+    @staticmethod
+    def _check_hipo_available(name):
+        # HiPO is an optional part of HiGHS; some builds (e.g. the PyPI wheels)
+        # reject solver="hipo". Probe on a scratch instance so the error shows
+        # up when the option is set, not in the middle of a solve.
+        probe = highspy.Highs()
+        probe.setOptionValue("output_flag", False)
+        if probe.setOptionValue("solver", "hipo") != highspy.HighsStatus.kOk:
+            raise ValueError(
+                "%s='hipo' requested, but this HiGHS build does not include HiPO." % name)
+
+    def _apply_solver_method(self):
+        """Push lp_method or qp_method to HiGHS' single 'solver' option.
+
+        HiGHS has one "solver" option for both LP and QP, so which of the two
+        settings is active depends on whether the objective currently has a
+        quadratic part. Called on every change of either setting and again
+        right before each solve (the objective may have switched type).
+        """
+        if self.problem is None or self.problem.problem is None:
+            return
+        if self.problem._last_objective_was_quadratic:
+            method, table, name = self._qp_method, self._QP_METHOD_TO_HIGHS, "qp_method"
+        else:
+            method, table, name = self._lp_method, self._LP_METHOD_TO_HIGHS, "lp_method"
+        status = self.problem.problem.setOptionValue("solver", table[method])
+        if status != highspy.HighsStatus.kOk:
+            raise ValueError("HiGHS rejected %s=%r." % (name, method))
+
+    @property
+    def lp_method(self):
+        """Algorithm used for LPs: 'auto', 'simplex', 'interior point' or 'hipo'."""
+        return self._lp_method
+
+    @lp_method.setter
+    def lp_method(self, value):
+        self._check_method(value, self.lp_methods, "lp_method")
+        if value == "hipo":
+            self._check_hipo_available("lp_method")
+        self._lp_method = value
+        self._apply_solver_method()
+
+    @property
+    def qp_method(self):
+        """Algorithm used for QPs: 'auto', 'active set' or 'hipo'."""
+        return self._qp_method
+
+    @qp_method.setter
+    def qp_method(self, value):
+        self._check_method(value, self.qp_methods, "qp_method")
+        if value == "hipo":
+            self._check_hipo_available("qp_method")
+        self._qp_method = value
+        self._apply_solver_method()
 
     def _apply_tolerances(self):
         if self.problem is not None and self.problem.problem is not None:
@@ -1156,7 +1242,23 @@ class Model(interface.Model):
             empty_hessian.value_ = np.array([], dtype=np.double)
             self.problem.passHessian(empty_hessian)
             
-        self._last_objective_was_quadratic = len(quadratic_coeffs) > 0
+        self._set_objective_is_quadratic(len(quadratic_coeffs) > 0)
+
+    def _set_objective_is_quadratic(self, is_quadratic):
+        """Record whether the objective has a quadratic part.
+
+        HiGHS has a single "solver" option for LP and QP, so whenever the
+        objective flips between the two, the matching method (lp_method or
+        qp_method) has to be pushed to HiGHS. This is the only place the flag
+        is written, so no re-apply is needed at solve time.
+        """
+        changed = is_quadratic != self._last_objective_was_quadratic
+        self._last_objective_was_quadratic = is_quadratic
+        # configuration doesn't exist yet if the objective is passed to
+        # Model.__init__; Configuration.__init__ applies everything itself then.
+        configuration = getattr(self, "configuration", None)
+        if changed and configuration is not None:
+            configuration._apply_solver_method()
 
     def _sync_objective_to_solver(self):
         """Sync the current objective's internal state to the HiGHS solver."""
@@ -1315,6 +1417,10 @@ class Model(interface.Model):
                 k: v for k, v in self.objective._quadratic_coeffs.items()
                 if k[0] not in removed_names and k[1] not in removed_names
             }
+            # Deliberately not _update_quadratic_objective(): it calls
+            # self.update(), which would re-enter this method while the
+            # removal is still pending.
+            self._set_objective_is_quadratic(bool(self.objective._quadratic_coeffs))
 
     def _remove_constraints(self, constraints):
         for constraint in constraints:
@@ -1554,4 +1660,4 @@ class Model(interface.Model):
         return self._objective_value
 
 
-__all__ = ["Variable", "Constraint", "Objective", "Configuration", "Model", "_get_quadratic_terms"]
+__all__ = ["Variable", "Constraint", "Objective", "Configuration", "Model"]
