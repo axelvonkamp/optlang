@@ -1609,71 +1609,74 @@ class Model(interface.Model):
     def is_integer(self):
         return any(int_type != highspy.HighsVarType.kContinuous for int_type in self.problem.getLp().integrality_)
 
-    def _ensure_solution_arrays(self):
-        if self._solution_col_value is not None:
-            return
-        solution = self.problem.getSolution()
-        self._solution_col_value = list(solution.col_value)
-        self._solution_row_value = list(solution.row_value)
-        if self.problem.getInfo().dual_solution_status == highspy.SolutionStatus.kSolutionStatusFeasible:
-            self._solution_row_dual = list(solution.row_dual)
-            self._solution_col_dual = list(solution.col_dual)
-
-    def _get_primal_values(self):
-        if not self._has_solution:
-            return None
-        self._ensure_solution_arrays()
+    def _col_values(self):
+        # highspy builds a fresh Python list on every attribute access (O(n)),
+        # so convert once and keep it.
+        if self._solution_col_value is None:
+            self._solution_col_value = self.problem.getSolution().col_value
         return self._solution_col_value
+
+    def _col_duals(self):
+        if self._solution_col_dual is None:
+            self._solution_col_dual = self.problem.getSolution().col_dual
+        return self._solution_col_dual
+
+    def _row_values(self):
+        if self._solution_row_value is None:
+            self._solution_row_value = self.problem.getSolution().row_value
+        return self._solution_row_value
+
+    def _row_duals(self):
+        if self._solution_row_dual is None:
+            self._solution_row_dual = self.problem.getSolution().row_dual
+        return self._solution_row_dual
+
+    def _require_dual_solution(self):
+        if (self.problem.getInfo().dual_solution_status
+                != highspy.SolutionStatus.kSolutionStatusFeasible):
+            raise ValueError("Dual values unavailable/not well-defined for integer problems")
+
+    # bulk getters
+    def _get_primal_values(self):
+        return self._col_values() if self._has_solution else None
 
     def _get_reduced_costs(self):
         if not self._has_solution:
             return None
-        if self.problem.getInfo().dual_solution_status != highspy.SolutionStatus.kSolutionStatusFeasible:
-            raise ValueError("Dual values unavailable/not well-defined for integer problems")
-        self._ensure_solution_arrays()
-        return self._solution_col_dual
+        self._require_dual_solution()
+        return self._col_duals()
 
     def _get_constraint_values(self):
-        if not self._has_solution:
-            return None
-        self._ensure_solution_arrays()
-        return self._solution_row_value
+        return self._row_values() if self._has_solution else None
 
     def _get_shadow_prices(self):
         if not self._has_solution:
             return None
-        if self.problem.getInfo().dual_solution_status != highspy.SolutionStatus.kSolutionStatusFeasible:
-            raise ValueError("Dual values unavailable/not well-defined for integer problems")
-        self._ensure_solution_arrays()
-        return self._solution_row_dual
+        self._require_dual_solution()
+        return self._row_duals()
 
+    # single-value accessors
     def _variable_primal(self, variable):
         if not self._has_solution:
             return None
-        self._ensure_solution_arrays()
-        return self._solution_col_value[variable._solver_index]
+        return self._col_values()[variable._solver_index]
 
     def _variable_dual(self, variable):
         if not self._has_solution:
             return None
-        if self.problem.getInfo().dual_solution_status != highspy.SolutionStatus.kSolutionStatusFeasible:
-            raise ValueError("Dual values unavailable/not well-defined for integer problems")
-        self._ensure_solution_arrays()
-        return float(self._solution_col_dual[variable._solver_index])
+        self._require_dual_solution()
+        return self._col_duals()[variable._solver_index]
 
     def _constraint_primal(self, constraint):
         if not self._has_solution:
             return None
-        self._ensure_solution_arrays()
-        return float(self._solution_row_value[constraint._solver_index])
+        return self._row_values()[constraint._solver_index]
 
     def _constraint_dual(self, constraint):
         if not self._has_solution:
             return None
-        if self.problem.getInfo().dual_solution_status != highspy.SolutionStatus.kSolutionStatusFeasible:
-            raise ValueError("Dual values unavailable/not well-defined for integer problems")
-        self._ensure_solution_arrays()
-        return float(self._solution_row_dual[constraint._solver_index])
+        self._require_dual_solution()
+        return self._row_duals()[constraint._solver_index]
 
     def _get_objective_value(self):
         if not self._has_solution:
