@@ -1277,6 +1277,8 @@ class Model(interface.Model):
         # is the sole source of truth for which constraints reference which
         # variable (see Constraint._get_expression / get_linear_coefficients,
         # and _remove_variables below), so no separate mapping is kept here.
+        if variables:
+            self._invalidate_solution()
         for variable in variables:
             self._variables.append(variable)
             variable.problem = self
@@ -1300,6 +1302,8 @@ class Model(interface.Model):
         # Same as interface.Model._add_constraints, minus its
         # _variables_to_constraints_mapping bookkeeping -- not needed here
         # for the same reason as in _add_variables above.
+        if constraints:
+            self._invalidate_solution()
         for constraint in constraints:
             if sloppy is False:
                 variables = constraint.variables
@@ -1344,6 +1348,8 @@ class Model(interface.Model):
         return matching_rows
 
     def _remove_variables(self, variables):
+        if variables:
+            self._invalidate_solution()
         for variable in variables:
             try:
                 self._variables[variable.name]
@@ -1423,6 +1429,8 @@ class Model(interface.Model):
             self._set_objective_is_quadratic(bool(self.objective._quadratic_coeffs))
 
     def _remove_constraints(self, constraints):
+        if constraints:
+            self._invalidate_solution()
         for constraint in constraints:
             try:
                 self._constraints[constraint.name]
@@ -1566,6 +1574,7 @@ class Model(interface.Model):
         )
 
     def _optimize(self):
+        self._clear_cached_solution()
         h = self.problem
         h.run()
 
@@ -1573,13 +1582,28 @@ class Model(interface.Model):
         status = _HIGHS_STATUS_TO_STATUS.get(status_str, interface.UNDEFINED)
 
         self._has_solution = status in _STATUSES_WITH_USABLE_SOLUTION
+
+        return status
+
+    def _clear_cached_solution(self):
+        """Drop the Python-side copies of the last solution (rebuilt lazily)."""
         self._solution_col_value = None
         self._solution_col_dual = None
         self._solution_row_value = None
         self._solution_row_dual = None
         self._objective_value = None
 
-        return status
+    def _invalidate_solution(self):
+        """Forget the last solution after the model's shape has changed.
+
+        The cached solution vectors are indexed by column/row position. Adding
+        columns/rows leaves them too short for the new objects' _solver_index,
+        and removing columns/rows shifts every later index down, so a cached
+        vector would silently belong to a different variable/constraint. Call
+        this from every method that adds or removes columns or rows.
+        """
+        self._has_solution = False
+        self._clear_cached_solution()
 
     @property
     def is_integer(self):
@@ -1591,7 +1615,7 @@ class Model(interface.Model):
         solution = self.problem.getSolution()
         self._solution_col_value = list(solution.col_value)
         self._solution_row_value = list(solution.row_value)
-        if not self.is_integer:
+        if self.problem.getInfo().dual_solution_status == highspy.SolutionStatus.kSolutionStatusFeasible:
             self._solution_row_dual = list(solution.row_dual)
             self._solution_col_dual = list(solution.col_dual)
 
@@ -1604,8 +1628,8 @@ class Model(interface.Model):
     def _get_reduced_costs(self):
         if not self._has_solution:
             return None
-        if self.is_integer:
-            raise ValueError("Dual values are not well-defined for integer problems")
+        if self.problem.getInfo().dual_solution_status != highspy.SolutionStatus.kSolutionStatusFeasible:
+            raise ValueError("Dual values unavailable/not well-defined for integer problems")
         self._ensure_solution_arrays()
         return self._solution_col_dual
 
@@ -1618,8 +1642,8 @@ class Model(interface.Model):
     def _get_shadow_prices(self):
         if not self._has_solution:
             return None
-        if self.is_integer:
-            raise ValueError("Dual values are not well-defined for integer problems")
+        if self.problem.getInfo().dual_solution_status != highspy.SolutionStatus.kSolutionStatusFeasible:
+            raise ValueError("Dual values unavailable/not well-defined for integer problems")
         self._ensure_solution_arrays()
         return self._solution_row_dual
 
@@ -1632,8 +1656,8 @@ class Model(interface.Model):
     def _variable_dual(self, variable):
         if not self._has_solution:
             return None
-        if self.is_integer:
-            raise ValueError("Dual values are not well-defined for integer problems")
+        if self.problem.getInfo().dual_solution_status != highspy.SolutionStatus.kSolutionStatusFeasible:
+            raise ValueError("Dual values unavailable/not well-defined for integer problems")
         self._ensure_solution_arrays()
         return float(self._solution_col_dual[variable._solver_index])
 
@@ -1646,8 +1670,8 @@ class Model(interface.Model):
     def _constraint_dual(self, constraint):
         if not self._has_solution:
             return None
-        if self.is_integer:
-            raise ValueError("Dual values are not well-defined for integer problems")
+        if self.problem.getInfo().dual_solution_status != highspy.SolutionStatus.kSolutionStatusFeasible:
+            raise ValueError("Dual values unavailable/not well-defined for integer problems")
         self._ensure_solution_arrays()
         return float(self._solution_row_dual[constraint._solver_index])
 
