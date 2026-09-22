@@ -26,7 +26,6 @@ except ImportError:
 
 from optlang import interface
 from optlang import symbolics
-from optlang.expression_parsing import parse_optimization_expression
 from optlang.exceptions import ContainerAlreadyContains
 
 log = logging.getLogger(__name__)
@@ -66,133 +65,76 @@ _STATUSES_WITH_USABLE_SOLUTION = frozenset([
 ])
 
 
-def _linear_expression_to_dict(expression):
-    """Turn a linear sympy/symengine expression into ({var_name: coeff}, constant)."""
-    if getattr(expression, "is_Add", False):
-        terms = expression.args
-    else:
-        terms = (expression,)
+def _split_terms(expression, _expanded=False):
+    """Split a linear/quadratic sympy/symengine expression in a single pass.
 
-    coeffs = defaultdict(float)
+    Returns ``(linear, quadratic, constant)`` where
+
+    * ``linear`` is ``{var_name: coeff}``,
+    * ``quadratic`` is ``{(name1, name2): coeff}`` with the names sorted (a
+      square ``c*x**2`` is stored as ``(x, x): c``),
+    * ``constant`` is the constant offset.
+
+    The fast path handles the shapes that show up in practice: numbers,
+    ``x``, ``c*x``, ``c*x*y`` and ``c*x**2`` (as terms of an ``Add`` or on
+    their own). If a term has any other shape (e.g. an unexpanded product) the
+    expression is expanded once and parsed again; if that still fails, or the
+    degree is above 2, a ``ValueError`` is raised. That makes this function
+    double as the linear/quadratic validity check.
+    """
+    terms = expression.args if getattr(expression, "is_Add", False) else (expression,)
+    linear = defaultdict(float)
+    quadratic = defaultdict(float)
     constant = 0.0
 
     for term in terms:
         if term.is_Number:
             constant += float(term)
-        elif term.is_Symbol:
-            coeffs[term.name] += 1.0
-        elif term.is_Mul and len(term.args) == 2:
-            coeff, sym = term.args
-            if coeff.is_Number and sym.is_Symbol:
-                coeffs[sym.name] += float(coeff)
+            continue
+
+        coeff = 1.0
+        names = []
+        for factor in (term.args if term.is_Mul else (term,)):
+            if factor.is_Number:
+                coeff *= float(factor)
+            elif factor.is_Symbol:
+                names.append(factor.name)
+            elif (factor.is_Pow and factor.args[0].is_Symbol
+                  and factor.args[1].is_Number and float(factor.args[1]) == 2.0):
+                names.extend((factor.args[0].name,) * 2)
             else:
-                return _linear_expression_to_dict_fallback(expression)
-        else:
-            return _linear_expression_to_dict_fallback(expression)
+                break
+        else:  # every factor was recognised
+            n = len(names)
+            if n == 0:
+                constant += coeff
+            elif n == 1:
+                linear[names[0]] += coeff
+            elif n == 2:
+                quadratic[tuple(sorted(names))] += coeff
+            else:
+                raise ValueError("Degree > 2 detected: %s" % term)
+            continue
 
-    return dict(coeffs), constant
+        # Unrecognised factor: expand once and retry, otherwise give up.
+        if _expanded:
+            raise ValueError("Unsupported term in expression: %s" % term)
+        return _split_terms(expression.expand(), _expanded=True)
 
-def _linear_expression_to_dict_fallback(expression):
-    offset, linear_coeffs, _ = parse_optimization_expression(None, linear=True, expression=expression)
-    coeffs = {var.name: float(coeff) for var, coeff in linear_coeffs.items()}
-    return coeffs, float(offset)
+    return dict(linear), dict(quadratic), constant
+
+
+def _linear_expression_to_dict(expression):
+    """Turn a linear expression into ({var_name: coeff}, constant)."""
+    linear, quadratic, constant = _split_terms(expression)
+    if quadratic:
+        raise ValueError("Expression is not linear.")
+    return linear, constant
+
 
 def _separate_linear_and_quadratic_from_expr(expression):
-    """
-    Separates a raw SymPy expression into linear and quadratic coefficients.
-    """
-    # if isinstance(expression, (int, float)):
-    #     expression = symbolics.sympify(expression)
-    # else:
-    expression = expression.expand()
-    
-    # 1. Extract Quadratic Terms and get the remaining (linear) expression
-    quadratic_coeffs, remaining_expr = _get_quadratic_terms_from_expr(expression)
-    
-    # 2. Parse the remaining expression using the dedicated linear parser
-    linear_coeffs, constant = _linear_expression_to_dict(remaining_expr)
-            
-    return linear_coeffs, quadratic_coeffs, constant
-
-def _get_quadratic_terms_from_expr(expression):
-    """Extract quadratic terms from a raw expression.
-
-    Returns:
-        quadratic_coeffs (dict): {(var1_name, var2_name): coeff}
-        remaining_expression (sympy.Expr): The expression with quadratic terms removed.
-    """
-    quadratic_coeffs = defaultdict(float)
-
-    # # Ensure we are working with a SymPy object
-    # if isinstance(expression, (int, float)):
-    #     expression = symbolics.sympify(expression)
-    # else:
-    #     expression = expression.expand()
-    
-    # We will build the remaining expression by subtracting quadratic terms
-    # However, subtracting SymPy objects can be tricky with types.
-    # Instead, we can iterate through the terms and pick out what's NOT quadratic.
-
-    remaining_terms = []
-
-    def process_term(term):
-        coeff = 1.0
-        factors = []
-        
-        if term.is_Number:
-            remaining_terms.append(term)
-            return True 
-            
-        if term.is_Mul:
-            args = term.args
-        else:
-            args = [term]
-            
-        for arg in args:
-            if arg.is_Number:
-                coeff *= float(arg)
-            elif arg.is_Symbol:
-                factors.append(arg.name)
-            elif arg.is_Pow:
-                base, exp = arg.args
-                if exp.is_Number and float(exp) == 2.0 and base.is_Symbol:
-                    factors.append(base.name)
-                    factors.append(base.name)
-                else:
-                    # Non-quadratic power, keep it in remaining
-                    remaining_terms.append(term)
-                    return False
-            else:
-                # Complex term, keep it
-                remaining_terms.append(term)
-                return False
-        
-        if len(factors) == 2:
-            # Quadratic term x*y
-            v1, v2 = sorted(factors)
-            quadratic_coeffs[(v1, v2)] += coeff
-            return True
-        elif len(factors) == 0:
-            # This was just a number, handled by is_Number check above
-            return True
-        elif len(factors) == 1:
-            # Linear term
-            remaining_terms.append(term)
-            return True
-        else:
-            # Degree > 2
-            raise ValueError("Degree > 2 detected.")
-
-    if getattr(expression, "is_Add", False):
-        for term in expression.args:
-            process_term(term)
-    else:
-        process_term(expression)
-        
-    # Reconstruct the remaining expression from the kept terms
-    remaining_expression = symbolics.add(remaining_terms) if remaining_terms else symbolics.sympify(0)
-            
-    return dict(quadratic_coeffs), remaining_expression
+    """Return (linear_coeffs, quadratic_coeffs, constant) of an expression."""
+    return _split_terms(expression)
 
 
 class Variable(interface.Variable):
@@ -315,20 +257,31 @@ class Constraint(interface.Constraint):
     _INDICATOR_CONSTRAINT_SUPPORT = False
 
     def __init__(self, expression, sloppy=False, *args, **kwargs):
-        if isinstance(expression, (int, float)):
+        # A bare number (e.g. the `Constraint(0, ...)` bootstrap used to set
+        # up a constraint that will be filled in afterwards via
+        # set_linear_coefficients({var: coeff, ...})) needs no symbolic
+        # parsing at all: capture it as a plain float and skip straight to
+        # the trivial coefficients below.
+        _constant = float(expression) if isinstance(expression, (int, float)) else None
+        if _constant is not None:
             sloppy = True
             expression = symbolics.Real(expression)
 
         self._expression_expired = False
         super(Constraint, self).__init__(expression, sloppy=sloppy, *args, **kwargs)
 
-        if not sloppy and not self.is_Linear:
-            raise ValueError(
-                "The HiGHS interface only supports linear constraints. "
-                "%s is not linear." % self
-            )
-
-        self._initial_coeffs, self._constant = _linear_expression_to_dict(self.expression)
+        if _constant is not None:
+            self._initial_coeffs, self._constant = {}, _constant
+        else:
+            # Parsing doubles as the linearity check (raises ValueError for
+            # anything non-linear), so no separate is_Linear pass is needed.
+            try:
+                self._initial_coeffs, self._constant = _linear_expression_to_dict(self.expression)
+            except ValueError as err:
+                raise ValueError(
+                    "The HiGHS interface only supports linear constraints. "
+                    "%s is not linear." % self
+                ) from err
         # The row index of this constraint in the HiGHS problem it currently
         # belongs to (None if it isn't attached to a model, or not yet added
         # to the model's HiGHS instance). See Variable._solver_index for why
@@ -488,24 +441,34 @@ class Objective(interface.Objective):
     """
 
     def __init__(self, expression, sloppy=False, *args, **kwargs):
-        if isinstance(expression, (int, float)):
+        # Same reasoning as Constraint.__init__: a bare number (typically
+        # `Objective(0, ...)` followed by
+        # set_coefficients(linear={var: coeff, ...})) needs no symbolic
+        # parsing - capture it as a plain float up front.
+        _constant = float(expression) if isinstance(expression, (int, float)) else None
+        if _constant is not None:
             expression = symbolics.Real(expression)
             sloppy = True
 
         kwargs['sloppy'] = sloppy
         super(Objective, self).__init__(expression, *args, **kwargs)
 
-        if not sloppy:
-            if not (self.is_Linear or self.is_Quadratic):
-                raise ValueError("The HiGHS interface only supports linear or quadratic objectives.")
-
         # Bootstrap values only: _initial_linear_coeffs seeds HiGHS's cost
         # vector the first time this Objective is attached to a model (see
         # Model._update_linear_objective) and is never consulted again after
         # that. _quadratic_coeffs remains the ongoing source of truth for the
-        # Hessian (see class docstring).
-        self._initial_linear_coeffs, self._quadratic_coeffs, self._constant = \
-            _separate_linear_and_quadratic_from_expr(self.expression)
+        # Hessian (see class docstring). Parsing doubles as the
+        # linear/quadratic validity check (raises ValueError otherwise).
+        if _constant is not None:
+            self._initial_linear_coeffs, self._quadratic_coeffs, self._constant = {}, {}, _constant
+        else:
+            try:
+                self._initial_linear_coeffs, self._quadratic_coeffs, self._constant = \
+                    _separate_linear_and_quadratic_from_expr(self.expression)
+            except ValueError as err:
+                raise ValueError(
+                    "The HiGHS interface only supports linear or quadratic objectives."
+                ) from err
 
     def _get_expression(self):
         """Reconstruct the expression, reading the linear part live from HiGHS."""
@@ -1198,8 +1161,12 @@ class Model(interface.Model):
         # Objective (e.g. `obj = Objective(x); obj += 2 * y; model.objective
         # = obj`) working correctly without having to intercept every
         # mutating operator individually.
-        linear_coeffs, _, obj_constant = _separate_linear_and_quadratic_from_expr(self.objective._expression)
+        linear_coeffs, quadratic_coeffs, obj_constant = \
+            _separate_linear_and_quadratic_from_expr(self.objective._expression)
         self.objective._initial_linear_coeffs = linear_coeffs
+        # Refresh the Hessian snapshot too, so e.g. `obj += y**2` before
+        # attachment is not lost (_update_quadratic_objective reads this).
+        self.objective._quadratic_coeffs = quadratic_coeffs
         self.objective._constant = obj_constant
 
         for var_name, coeff in linear_coeffs.items():
